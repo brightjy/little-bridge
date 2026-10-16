@@ -488,8 +488,14 @@ export default function App() {
 
   const isInitialMount = useRef(true);
   const recognitionRef = useRef(null);
+  const mediaRecorderRef = useRef(null);
+  const latestTranscriptRef = useRef('');
+  const didTriggerFromVoiceRef = useRef(false);
+  const koreanInputRef = useRef(null);
   const outputCardRef = useRef(null);
   const [isListening, setIsListening] = useState(false);
+  const [voiceModeLabel, setVoiceModeLabel] = useState('');
+  const [iosVoiceGuide, setIosVoiceGuide] = useState('');
 
   // Available browser speech voices
   const [voices, setVoices] = useState([]);
@@ -723,19 +729,134 @@ Return a valid JSON object with EXACTLY these 5 keys:
     generateVoice(presetExample, parentingStyle, childAge, sitKey, apiKey, false);
   };
 
-  // Speech Recognition (STT) for Korean voice input
-  const toggleListening = () => {
-    const SpeechRecognition = typeof window !== 'undefined' ? (window.SpeechRecognition || window.webkitSpeechRecognition) : null;
-    if (!SpeechRecognition) {
-      alert('이 브라우저는 음성 인식(STT)을 지원하지 않습니다.');
+  // Helper: Convert recorded audio Blob to Base64 for Gemini Multimodal STT
+  const blobToBase64 = (blob) =>
+    new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onloadend = () => {
+        const base64String = (reader.result || '').toString().split(',')[1] || '';
+        resolve(base64String);
+      };
+      reader.onerror = reject;
+      reader.readAsDataURL(blob);
+    });
+
+  // Fallback for iOS Home Screen Standalone PWA where Apple blocks webkitSpeechRecognition
+  const startMediaRecorderFallback = async () => {
+    const effectiveApiKey = apiKey || import.meta.env.VITE_GEMINI_API_KEY;
+
+    // If no API key or no mediaDevices, focus textarea immediately for iOS Native Keyboard Dictation (🎙️)
+    if (!effectiveApiKey || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      if (koreanInputRef.current) {
+        koreanInputRef.current.focus();
+      }
+      setIosVoiceGuide(
+        '💡 아이폰 [홈 화면 앱]에서는 iOS 보안 정책상 웹 음성인식이 제한됩니다. 지금 올라온 아이폰 키보드 우측 하단의 마이크(🎙️) 버튼을 누르시면 가장 빠르고 정확하게 음성 입력이 됩니다! (또는 상단 🔑 버튼에 Gemini API 키를 넣으면 자체 AI 음성 녹음이 작동합니다.)'
+      );
       return;
     }
 
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const mimeType = MediaRecorder.isTypeSupported('audio/mp4')
+        ? 'audio/mp4'
+        : MediaRecorder.isTypeSupported('audio/webm')
+        ? 'audio/webm'
+        : '';
+      const recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+      const chunks = [];
+
+      recorder.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0) chunks.push(e.data);
+      };
+
+      recorder.onstop = async () => {
+        stream.getTracks().forEach((t) => t.stop());
+        setIsListening(false);
+        setVoiceModeLabel('');
+
+        if (chunks.length === 0) return;
+        const audioBlob = new Blob(chunks, { type: recorder.mimeType || 'audio/mp4' });
+        setIsLoading(true);
+        setIosVoiceGuide('');
+        try {
+          const base64Audio = await blobToBase64(audioBlob);
+          const ai = new GoogleGenAI({ apiKey: effectiveApiKey });
+          const sttResponse = await ai.models.generateContent({
+            model: 'gemini-2.5-flash',
+            contents: [
+              {
+                inlineData: {
+                  mimeType: audioBlob.type || 'audio/mp4',
+                  data: base64Audio
+                }
+              },
+              '이 한국어 음성을 들리는 그대로 한국어 텍스트로만 정확히 받아적어줘. 다른 설명이나 따옴표 없이 한국어 문장만 출력해.'
+            ]
+          });
+          const transcribed = (sttResponse?.text || '').trim();
+          if (transcribed) {
+            setKoreanText(transcribed);
+            generateVoice(transcribed, parentingStyle, childAge, situation, effectiveApiKey, true);
+          } else {
+            setIsLoading(false);
+          }
+        } catch (err) {
+          console.error('Gemini Audio STT error:', err);
+          setIsLoading(false);
+          if (koreanInputRef.current) koreanInputRef.current.focus();
+          setIosVoiceGuide('키보드 우측 하단의 마이크(🎙️) 버튼을 눌러 말씀해 주세요.');
+        }
+      };
+
+      mediaRecorderRef.current = recorder;
+      recorder.start();
+      setIsListening(true);
+      setVoiceModeLabel('녹음 완료 (터치)');
+      setIosVoiceGuide('🎙️ 말씀하신 후 [녹음 완료] 버튼을 한 번 더 눌러주세요.');
+    } catch {
+      setIsListening(false);
+      setVoiceModeLabel('');
+      if (koreanInputRef.current) {
+        koreanInputRef.current.focus();
+      }
+      setIosVoiceGuide(
+        '💡 아이폰 키보드 우측 하단의 마이크(🎙️) 버튼을 누르시면 바로 음성으로 말할 수 있습니다!'
+      );
+    }
+  };
+
+  // Speech Recognition (STT) for Korean voice input (with iOS Safari & Standalone PWA support)
+  const toggleListening = () => {
+    setIosVoiceGuide('');
+
+    // If currently listening/recording, stop and process immediately
     if (isListening) {
+      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+        try { mediaRecorderRef.current.stop(); } catch {}
+        return;
+      }
       if (recognitionRef.current) {
         try { recognitionRef.current.stop(); } catch {}
       }
       setIsListening(false);
+      setVoiceModeLabel('');
+      return;
+    }
+
+    const isIOSStandalone =
+      typeof window !== 'undefined' &&
+      (window.navigator.standalone === true ||
+        (window.matchMedia('(display-mode: standalone)').matches &&
+          /iPhone|iPad|iPod/i.test(navigator.userAgent)));
+
+    const SpeechRecognition =
+      typeof window !== 'undefined' ? window.SpeechRecognition || window.webkitSpeechRecognition : null;
+
+    // On iOS Home Screen Standalone mode, Apple disables webkitSpeechRecognition (throws service-not-allowed).
+    // Immediately use MediaRecorder + Gemini Audio or iOS Native Dictation helper!
+    if (!SpeechRecognition || isIOSStandalone) {
+      startMediaRecorderFallback();
       return;
     }
 
@@ -745,26 +866,58 @@ Return a valid JSON object with EXACTLY these 5 keys:
       recognition.continuous = false;
       recognition.interimResults = true;
 
-      recognition.onstart = () => setIsListening(true);
+      latestTranscriptRef.current = '';
+      didTriggerFromVoiceRef.current = false;
+
+      recognition.onstart = () => {
+        setIsListening(true);
+        setVoiceModeLabel('듣는 중... (완료 시 터치)');
+      };
+
       recognition.onresult = (event) => {
-        let currentTranscript = '';
-        for (let i = event.resultIndex; i < event.results.length; i++) {
-          currentTranscript += event.results[i][0].transcript;
+        let fullTranscript = '';
+        for (let i = 0; i < event.results.length; i++) {
+          fullTranscript += event.results[i][0].transcript;
         }
-        if (currentTranscript) {
-          setKoreanText(currentTranscript);
+        if (fullTranscript) {
+          latestTranscriptRef.current = fullTranscript;
+          setKoreanText(fullTranscript);
           if (event.results[event.results.length - 1].isFinal) {
-            generateVoice(currentTranscript, parentingStyle, childAge, situation, apiKey, true);
+            didTriggerFromVoiceRef.current = true;
+            generateVoice(fullTranscript, parentingStyle, childAge, situation, apiKey, true);
           }
         }
       };
-      recognition.onerror = () => setIsListening(false);
-      recognition.onend = () => setIsListening(false);
+
+      recognition.onerror = (event) => {
+        setIsListening(false);
+        setVoiceModeLabel('');
+        // If iOS blocks webkitSpeechRecognition with service-not-allowed / not-allowed, fall back automatically
+        if (
+          event?.error === 'service-not-allowed' ||
+          event?.error === 'not-allowed' ||
+          event?.error === 'audio-capture'
+        ) {
+          startMediaRecorderFallback();
+        }
+      };
+
+      recognition.onend = () => {
+        setIsListening(false);
+        setVoiceModeLabel('');
+        // iOS Safari often fires onend without setting isFinal=true; trigger generation if transcript exists
+        if (latestTranscriptRef.current && !didTriggerFromVoiceRef.current) {
+          didTriggerFromVoiceRef.current = true;
+          generateVoice(latestTranscriptRef.current, parentingStyle, childAge, situation, apiKey, true);
+        }
+      };
 
       recognitionRef.current = recognition;
       recognition.start();
     } catch {
       setIsListening(false);
+      setVoiceModeLabel('');
+      startMediaRecorderFallback();
     }
   };
 
@@ -1066,13 +1219,27 @@ Return a valid JSON object with EXACTLY these 5 keys:
                       }`}
                     >
                       <Mic className="w-3 h-3" />
-                      <span>{isListening ? '듣는 중...' : '음성으로 말하기'}</span>
+                      <span>{isListening ? (voiceModeLabel || '듣는 중...') : '음성으로 말하기'}</span>
                     </button>
                   </div>
+
+                  {iosVoiceGuide && (
+                    <div className="p-2.5 rounded-xl bg-indigo-50/90 border border-indigo-200 text-indigo-900 text-[11px] leading-relaxed flex items-start justify-between gap-2">
+                      <span>{iosVoiceGuide}</span>
+                      <button
+                        type="button"
+                        onClick={() => setIosVoiceGuide('')}
+                        className="text-indigo-400 hover:text-indigo-700 font-bold shrink-0 cursor-pointer"
+                      >
+                        ✕
+                      </button>
+                    </div>
+                  )}
 
                   <div className="relative">
                     <textarea
                       id="korean-input-textarea"
+                      ref={koreanInputRef}
                       value={koreanText}
                       onChange={(e) => setKoreanText(e.target.value)}
                       onKeyDown={handleKeyDown}
